@@ -167,12 +167,18 @@
                  '((1 nil) (2 3)))))
 
 (ert-deftest ob-janet-test-parse-session-output ()
-  "REPL prompts and leading blank lines are stripped."
+  "REPL prompts and echo-marked lines are stripped."
   (should (equal (ob-janet--parse-session-output "repl:1:> (+ 1 1)\nrepl:2:> 2\n")
                  "(+ 1 1)\n2\n"))
   (should (equal (ob-janet--parse-session-output "\nrepl:10:> 42\n")
                  "42\n"))
-  (should (equal (ob-janet--parse-session-output "repl:1:> x\n") "x\n")))
+  (should (equal (ob-janet--parse-session-output "repl:1:> x\n") "x\n"))
+  (should (equal (ob-janet--parse-session-output
+                  "OBJNT:ECO;@{}ntext\nOBJNT:ECO;nil\nhello\n")
+                 "hello\n"))
+  (should (equal (ob-janet--parse-session-output
+                  "OBJNT:ECO;@{}\nsome text\nOBJNT:ECO;7\n")
+                 "some text\n")))
 
 (ert-deftest ob-janet-test-expand-body-vars ()
   "Variable definitions precede the body."
@@ -288,12 +294,12 @@
                   (concat "#+name: one\n"
                           "| Name |\n"
                           "|------|\n"
-                          "| Solo |\n"
+                          "| Sol  |\n"
                           "\n"
                           (ob-janet-test-src
                            "janet :var data=one :results output"
                            "(each row data (print (row 0)))")))
-                 "Solo\n")))
+                 "Sol\n")))
 
 (ert-deftest ob-janet-test-execute-debug ()
   "`:debug' prints the expanded body without evaluation."
@@ -361,17 +367,55 @@
     (ob-janet-test-cleanup-session "ert-init")))
 
 (ert-deftest ob-janet-test-execute-session ()
-  "Named blocks should share state across calls."
+  "Named blocks share state, output mode shows only stdout."
   (skip-unless (executable-find ob-janet-executable))
   (unwind-protect
       (progn
         (should (equal (org-babel-execute:janet
                         "(def n 7)" '((:session . "ert-exec") (:results . "output")))
-                       "7\n"))
+                       ""))
         (should (equal (org-babel-execute:janet
-                        "(* n 2)" '((:session . "ert-exec") (:results . "output")))
+                        "(print (* n 2))" '((:session . "ert-exec") (:results . "output")))
                        "14\n")))
     (ob-janet-test-cleanup-session "ert-exec")))
+
+(ert-deftest ob-janet-test-execute-session-output-final-print ()
+  "Output mode captures print output, including a final print."
+  (skip-unless (executable-find ob-janet-executable))
+  (unwind-protect
+      (progn
+        (should (equal (org-babel-execute:janet
+                        "(print \"one\")\n(print \"two\")\n(print \"three\")"
+                        '((:session . "ert-out") (:results . "output")))
+                       "one\ntwo\nthree\n"))
+        (should (equal (org-babel-execute:janet
+                        "(defn say [x] (print x))\n(say \"final\")"
+                        '((:session . "ert-out") (:results . "output")))
+                       "final\n")))
+    (ob-janet-test-cleanup-session "ert-out")))
+
+(ert-deftest ob-janet-test-execute-session-value ()
+  "Value mode returns the last statement of a session."
+  (skip-unless (executable-find ob-janet-executable))
+  (unwind-protect
+      (progn
+        (should (equal (org-babel-execute:janet
+                        "(def n 7)" '((:session . "ert-val") (:results . "value")))
+                       7))
+        (should (equal (org-babel-execute:janet
+                        "(+ n 2)" '((:session . "ert-val") (:results . "value")))
+                       9)))
+    (ob-janet-test-cleanup-session "ert-val")))
+
+(ert-deftest ob-janet-test-execute-session-value-non-scalar ()
+  "Session value mode matches non-session value mode for collections."
+  (skip-unless (executable-find ob-janet-executable))
+  (unwind-protect
+      (progn
+        (should (equal (org-babel-execute:janet
+                        "@[1 2 3]" '((:session . "ert-val2") (:results . "value")))
+                       "@[1 2 3]")))
+    (ob-janet-test-cleanup-session "ert-val2")))
 
 (provide 'ob-janet-test)
 

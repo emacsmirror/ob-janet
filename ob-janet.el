@@ -160,18 +160,11 @@
 ;;; Output parsing
 
 (defun ob-janet--parse-result (result)
-  "Parse Janet RESULT string, substituting nil for ob-janet-nil-to."
+  "Parse Janet RESULT string, substituting nil for `ob-janet-nil-to'."
   (let ((parsed (org-babel-script-escape (string-trim result))))
     (if (listp parsed)
         (mapcar (lambda (el) (if (equal el 'nil) ob-janet-nil-to el)) parsed)
       parsed)))
-
-
-(defun ob-janet--parse-session-output (output)
-  "Parse session OUTPUT, extracting result after echoed code."
-  ;; Remove any comint prompts and echoed input. keep the result
-  (let ((clean (replace-regexp-in-string "^repl:[0-9]+:> " "" output)))
-    (replace-regexp-in-string "\\`\n+" "" clean)))
 
 
 ;;; Sessions
@@ -180,8 +173,37 @@
   "Return non-nil if SESSION is a valid session name."
   (and session (not (string= session "none"))))
 
+(defconst ob-janet--session-echo-marker "OBJNT:ECO;"
+  "Prefix for values echoed by the REPL after each form.")
+
+(defconst ob-janet--session-value-marker "OBJNT:VAL;"
+  "Prefix for the value of the last statement.")
+
+(defconst ob-janet--session-end-marker "OBJNT:END;"
+  "Prefix for the sentinel that marks the end of evaluation.")
+
+
+(defun ob-janet--parse-session-output (output)
+  "Parse session OUTPUT, removing REPL prompts and echo-marked lines."
+  (let ((clean (replace-regexp-in-string
+                (format "^%s[^\n]*\\(?:\n\\|\\'\\)"
+                        (regexp-quote ob-janet--session-echo-marker))
+                "" output)))
+    (setq clean (replace-regexp-in-string "^repl:[0-9]+:> " "" clean))
+    (replace-regexp-in-string "\\`\n+" "" clean)))
+
+
+(defun ob-janet--extract-session-value (output)
+  "Extract the value of the last statement from session OUTPUT."
+  (or (and (string-match (format "^%s\\([^\n]*\\)"
+                                 (regexp-quote ob-janet--session-value-marker))
+                         output)
+           (match-string 1 output))
+      ""))
+
+
 (defun ob-janet--initiate-session (&optional session)
-  "Ensure a Janet REPL SESSION exists, return buffer name."
+  "Ensure a Janet REPL SESSION exists. Return buffer name."
   (let ((name (if (ob-janet--session-p session)
                   (format "janet-%s" session) "janet"))
         (process-environment
@@ -198,24 +220,62 @@
     (format "*%s*" name)))
 
 
-(defun ob-janet--execute-to-session (code session)
-  "Send CODE to SESSION and return output."
-  (let ((buf (ob-janet--initiate-session session)))
-    (with-current-buffer buf
-      (let* ((proc (get-buffer-process (current-buffer)))
-             (start (point-max)))
-        ;; Send code with newline
-        (comint-send-string proc (concat code "\n"))
-        ;; Wait for prompt to appear
-        (let ((deadline (+ (float-time) 5)))
-          (while (and (< (float-time) deadline)
-                      (not (save-excursion
-                             (goto-char (point-max))
-                             (re-search-backward comint-prompt-regexp nil t)
-                             (> (point) start))))
-            (accept-process-output proc 0.1)))
-        ;; Return everything after start (includes echoed code & output)
-        (buffer-substring-no-properties start (point-max))))))
+(defun ob-janet--session-payload (code value)
+  "Build the forms sent to Janet from CODE (with VALUE flag for :result).
+
+Installs an echo-marker in `curenv', evaluates CODE, optionally reads back
+the value of the last statement (i.e. :results value), then prints a unique
+sentinel so the caller knows evaluation is complete.
+Returns \(PAYLOAD . SENTINEL)."
+  (let ((sentinel (format "%s%s" ob-janet--session-end-marker
+                          (random most-positive-fixnum))))
+    (cons
+     (concat
+      (format "(put (curenv) :pretty-format \"%s%%q\")\n"
+              ob-janet--session-echo-marker)
+      code "\n"
+      (when value
+        (format "(print (string/format \"%s%%q\" (get-in (curenv) ['_ :value])))\n"
+                ob-janet--session-value-marker))
+      (format "(print \"%s\")\n" sentinel))
+     sentinel)))
+
+
+(defun ob-janet--wait-for-sentinel (proc sentinel start)
+  "Wait for SENTINEL in PROC buffer, starting from START.
+Return the position of the sentinel, or nil on timeout."
+  (let ((deadline (+ (float-time) 5)))
+    (while (and (< (float-time) deadline)
+                (not (save-excursion
+                       (goto-char (point-max))
+                       (re-search-backward (regexp-quote sentinel)
+                                           start t))))
+      (accept-process-output proc 0.1)))
+  (save-excursion
+    (goto-char start)
+    (let ((pos (re-search-forward (regexp-quote sentinel) nil t)))
+      (when pos (match-beginning 0)))))
+
+
+(defun ob-janet--execute-to-session (code session &optional value)
+  "Send CODE to SESSION and return the result.
+
+When VALUE is non-nil, return the value of the last statement evaluated,
+otherwise return everything written to stdout."
+  (with-current-buffer (ob-janet--initiate-session session)
+    (let* ((proc (get-buffer-process (current-buffer)))
+           (start (point-max))
+           (protocol (ob-janet--session-payload code value))
+           (payload (car protocol))
+           (sentinel (cdr protocol)))
+      (comint-send-string proc (concat payload "\n"))
+      ;; Return everything between start and the sentinel
+      (let* ((end (or (ob-janet--wait-for-sentinel proc sentinel start)
+                      (point-max)))
+             (text (buffer-substring-no-properties start end)))
+        (if value
+            (ob-janet--extract-session-value text)
+          (ob-janet--parse-session-output text))))))
 
 
 (defun ob-janet--execute-to-file (expanded file)
@@ -238,6 +298,21 @@
              (org-babel-process-file-name file)) "")))
 
 
+(defun ob-janet--result (result result-params processed)
+  "Assemble raw Janet RESULT into the final block result.
+
+Applies RESULT-PARAMS via `org-babel-result-cond', parsing the value with
+`ob-janet--parse-result' when needed, then (re)adds any column and row names
+requested through PROCESSED header arguments."
+  (org-babel-reassemble-table
+   (org-babel-result-cond result-params result
+                          (ob-janet--parse-result result))
+   (org-babel-pick-name (cdr (assq :colname-names processed))
+                        (cdr (assq :colnames processed)))
+   (org-babel-pick-name (cdr (assq :rowname-names processed))
+                        (cdr (assq :rownames processed)))))
+
+
 (defun org-babel-execute:janet (body params)
   "Execute Janet code BODY with header arguments PARAMS."
   (let* ((processed     (org-babel-process-params params))
@@ -258,26 +333,25 @@
                 (if (string= result-type "value")
                     (format ob-janet-value-wrapper body)
                   (format ob-janet-output-wrapper body)))
-      ;; output format
-      (when (not file)
-        (setq expanded (if (string= result-type "value")
-                           (format ob-janet-value-wrapper expanded)
-                         (format ob-janet-output-wrapper expanded))))
       ;; session or file?
       (cond
        ((ob-janet--session-p session)
-        (ob-janet--parse-session-output
-         (ob-janet--execute-to-session expanded session)))
-       (file (ob-janet--execute-to-file expanded file) nil)
+        ;; raw expanded body (no wrapper), defs persist across blocks
+        (ob-janet--result
+         (ob-janet--execute-to-session expanded session
+                                       (string= result-type "value"))
+         result-params processed))
+       (file
+        (ob-janet--execute-to-file expanded file) nil)
        (t
-        (let ((result (ob-janet--execute-external expanded cmd)))
-          (org-babel-reassemble-table
-           (org-babel-result-cond result-params result
-                                  (ob-janet--parse-result result))
-           (org-babel-pick-name (cdr (assq :colname-names processed))
-                                (cdr (assq :colnames processed)))
-           (org-babel-pick-name (cdr (assq :rowname-names processed))
-                                  (cdr (assq :rownames processed))))))))))
+        (ob-janet--result
+         (ob-janet--execute-external
+          (format (if (string= result-type "value")
+                      ob-janet-value-wrapper
+                    ob-janet-output-wrapper)
+                  expanded)
+          cmd)
+         result-params processed))))))
 
 
 ;;; Org-babel session functions

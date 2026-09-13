@@ -107,31 +107,37 @@ Variables can be passed from named Org blocks (including tables) or assigned in 
 
 ** Sessions
 
-Use =:session= for persistent state (sessions) across code blocks that share the same session name
+Use =:session= for persistent state (sessions) across code blocks that share the same session name. With the default =:results output=, only what the code prints to stdout is displayed. With  =:results value= only the return value from each block is displayed.
 
-#+begin_src janet :session counter :async
+#+begin_src janet :session counter
 (var *count* 0)
 (defn increment [] (++ *count*) *count*)
 #+end_src
 
 #+RESULTS:
-: 0
-: <function increment>
 
 #+begin_src janet :session counter
-(increment)
+(print (increment))
 #+end_src
 #+RESULTS:
 : 1
 
-#+begin_src janet :session counter :async
-(increment)
-(increment)
+#+begin_src janet :session counter
+(print (increment))  # displayed in RESULTS:
+(increment)          # NOT displayed in RESULTS:
 #+end_src
 
 #+RESULTS:
 : 2
-: 3
+
+Use =:results value= to return the value of the last statement instead of stdout.
+
+#+begin_src janet :session counter :results value
+(increment)
+#+end_src
+
+#+RESULTS:
+: 4
 
 ** Prologue and Epilogue
 
